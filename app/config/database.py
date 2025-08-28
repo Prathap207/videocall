@@ -7,9 +7,9 @@ from urllib.parse import quote_plus
 # Create DB if not exists
 try:
     conn = psycopg2.connect(
-        dbname="postgres",   # default DB
+        dbname="postgres",
         user="postgres",
-        password="root",
+        password="Gansram123",
         host="localhost"
     )
     conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
@@ -28,7 +28,7 @@ except Exception as e:
 
 # Database connection URL
 password = quote_plus("root")
-DATABASE_URL = f"postgresql://postgres:{password}@localhost:5432/demo"
+DATABASE_URL = "postgresql://postgres:Gansram123@localhost/live_streaming_app"
 
 engine = create_engine(DATABASE_URL,    pool_pre_ping=True, 
     pool_recycle=1800,)
