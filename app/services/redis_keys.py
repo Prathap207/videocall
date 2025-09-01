@@ -4,7 +4,6 @@ import json
 from typing import Optional
 import uuid
 import redis.asyncio as redis
-from videocall.app.routes.videoCall import MAX_CALL_DURATION
 
 # Redis Key Patterns
 KEY_CONNECTED_VENDORS = "vendors:connected"          # Set: vendor_id
@@ -16,7 +15,7 @@ KEY_ACTIVE_CALLS = "active:call:{room_name}"         # Hash: call info
 KEY_PENDING_REQUEST_ID = "reqid:cust:{customer_id}"  # String: request_id
 CHANNEL_VENDOR_NOTIFY = "notify:vendor:{vendor_id}"   # Pub/Sub channel
 CHANNEL_CUSTOMER_NOTIFY = "notify:cust:{customer_id}"
-
+MAX_CALL_DURATION = 800
 # -------------------------------
 # Redis Helpers
 # -------------------------------
@@ -56,7 +55,7 @@ async def dequeue_call_request(vendor_id: int) -> Optional[Dict]:
         return None
     return json.loads(data)
 
-async def peek_call_queue(vendor_id: int) -> List[Dict]:
+async def peek_call_queue(vendor_id: int):
     items = await redis_client.lrange(KEY_CALL_QUEUE.format(vendor_id=vendor_id), 0, -1)
     return [json.loads(item) for item in items]
 

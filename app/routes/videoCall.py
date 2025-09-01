@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict
 import uuid
 from starlette.websockets import WebSocketState
-
+import redis.asyncio as redis
 # Local modules
 from app.config import config
 from app.config.database import SessionLocal, engine
@@ -16,6 +16,13 @@ from app.schemas.databaseSchemas import Base, User, StreamSession, CallHistory, 
 
 # Create tables
 Base.metadata.create_all(bind=engine)
+redis_client: redis.Redis = None
+
+# Set Redis client from main app
+def set_redis_client(client: redis.Redis):
+    global redis_client
+    redis_client = client
+    print("✅ Redis client successfully injected into router!")
 
 router = APIRouter()
 
@@ -29,7 +36,7 @@ call_queue: list = []                            # [{ customer_id, vendor_id, ..
 pending_requests: Dict[int, Dict] = {}           # vendor_id → request data
 active_calls: Dict[str, Dict] = {}               # room_name → call info
 pending_request_ids: Dict[int, str] = {}         # customer_id → request_id
-MAX_CALL_DURATION = 30  # 30 seconds for testing
+MAX_CALL_DURATION = 800  # 30 seconds for testing
 
 # Dependency
 def get_db():
@@ -302,7 +309,6 @@ async def assign_next_request_to_vendor(vendor_id: int):
         vendor_ws = connected_vendors.get(vendor_id)
         if vendor_ws and is_websocket_connected(vendor_ws):
             await vendor_ws.send_text(json.dumps({
-                "is_incoming_call":True,
                 "event": "call_request",
                 "customer_name": cust_user.user_name,
                 "customer_id": customer_id,
