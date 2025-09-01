@@ -5,7 +5,7 @@ from app.config import database
 from app.routes import mainRouter
 from app.schemas import databaseSchemas
 from app.config.websocket import websocket_endpoint
-import redis.asyncio as redis
+# import redis.asyncio as redis
 from app.config import config
 
 app = FastAPI(version="1.0.0")
@@ -18,13 +18,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-redis_client: redis.Redis
+# redis_client: redis.Redis
 
-async def get_redis():
-    global redis_client
-    if not redis_client:
-        redis_client = redis.from_url(config.REDIS_URL, decode_responses=True)
-    return redis_client
+# async def get_redis():
+#     global redis_client
+#     if not redis_client:
+#         redis_client = redis.from_url(config.REDIS_URL, decode_responses=True)
+#     return redis_client
     
 
 @app.get("/")
