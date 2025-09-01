@@ -8,36 +8,52 @@ from datetime import datetime, timezone
 from typing import Optional, Dict
 import uuid
 from starlette.websockets import WebSocketState
+import redis.asyncio as redis
 
 # Local modules
 from app.config import config
-from app.config.database import SessionLocal, engine
+from app.config.database import SessionLocal, engine, get_db
 from app.schemas.databaseSchemas import Base, User, StreamSession, CallHistory, CallRequestHistory
 
 # Create tables
 Base.metadata.create_all(bind=engine)
+redis_client: redis.Redis = None
+
+
+def set_redis_client(client: redis.Redis):
+    global redis_client
+    redis_client = client
+    print("✅ Redis client successfully injected into router!")
+
 
 router = APIRouter()
 
 # -------------------------------
-# In-Memory State
+# Redis Key Prefixes
 # -------------------------------
-connected_vendors: Dict[int, WebSocket] = {}      # vendor_id → ws
-busy_vendors: set = set()                         # vendor_id
-customer_websockets: Dict[int, WebSocket] = {}   # customer_id → ws
-call_queue: list = []                            # [{ customer_id, vendor_id, ... }]
-pending_requests: Dict[int, Dict] = {}           # vendor_id → request data
-active_calls: Dict[str, Dict] = {}               # room_name → call info
-pending_request_ids: Dict[int, str] = {}         # customer_id → request_id
-MAX_CALL_DURATION = 800  # 800 seconds for testing
+PREFIX_CONNECTED_VENDORS = "ws:connected_vendors"  # hash: vendor_id → ws_id (we track connection via app-level id)
+PREFIX_BUSY_VENDORS = "ws:busy_vendors"            # set: vendor_id
+PREFIX_CUSTOMER_WS = "ws:customer_websockets"      # hash: customer_id → ws_id
+PREFIX_CALL_QUEUE = "ws:call_queue"                # list of JSON strings
+PREFIX_PENDING_REQUESTS = "ws:pending_requests"    # hash: vendor_id → JSON
+PREFIX_ACTIVE_CALLS = "ws:active_calls"            # hash: room_name → JSON
+PREFIX_PENDING_REQUEST_IDS = "ws:pending_request_ids"  # hash: customer_id → request_id
 
-# Dependency
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# For mapping WebSocket IDs (if needed in distributed setup)
+PREFIX_WS_REGISTRY = "ws:registry"  # hash: ws_id → {type, user_id}
+
+# Global WebSocket registry (temporary in-memory for current process)
+# In production, you'd need a shared message bus (e.g., Redis Pub/Sub + external WS service)
+connected_websockets: Dict[str, WebSocket] = {}
+WS_ID_COUNTER = 0
+ws_id_lock = asyncio.Lock()
+
+# Helper: Generate unique WS ID per connection in this process
+async def generate_ws_id() -> str:
+    global WS_ID_COUNTER
+    async with ws_id_lock:
+        WS_ID_COUNTER += 1
+        return f"ws_{WS_ID_COUNTER}"
 
 
 # -------------------------------
@@ -90,10 +106,13 @@ async def end_livekit_room(room_name: str):
 # -------------------------------
 # Helper: Queue Position
 # -------------------------------
-def get_queue_position(customer_id: int) -> Optional[Dict]:
+async def get_queue_position(customer_id: int) -> Optional[Dict]:
+    queue = await redis_client.lrange(PREFIX_CALL_QUEUE, 0, -1)
+    entries = [json.loads(item) for item in queue]
+
     target_entry = None
     vendor_id = None
-    for entry in call_queue:
+    for entry in entries:
         if entry["customer_id"] == customer_id:
             target_entry = entry
             vendor_id = entry["vendor_id"]
@@ -102,13 +121,13 @@ def get_queue_position(customer_id: int) -> Optional[Dict]:
         return None
 
     ahead_count = 0
-    for entry in call_queue:
+    for entry in entries:
         if entry["vendor_id"] == vendor_id:
             if entry["customer_id"] == customer_id:
                 break
             ahead_count += 1
 
-    is_vendor_busy = vendor_id in busy_vendors
+    is_vendor_busy = await redis_client.sismember(PREFIX_BUSY_VENDORS, str(vendor_id))
     total_wait_slots = (1 if is_vendor_busy else 0) + ahead_count
     wait_time = total_wait_slots * MAX_CALL_DURATION
 
@@ -130,9 +149,10 @@ def get_available_vendors(db: Session = Depends(get_db)):
     available = []
 
     for v in vendors:
-        is_online = v.user_id in connected_vendors
-        is_busy = v.user_id in busy_vendors
-        queue_size = len([c for c in call_queue if c["vendor_id"] == v.user_id])
+        is_online = asyncio.run(redis_client.hexists(PREFIX_CONNECTED_VENDORS, str(v.user_id)))
+        is_busy = asyncio.run(redis_client.sismember(PREFIX_BUSY_VENDORS, str(v.user_id)))
+        queue_size = len([c for c in asyncio.run(redis_client.lrange(PREFIX_CALL_QUEUE, 0, -1))
+                          if json.loads(c).get("vendor_id") == v.user_id])
 
         if is_online and not is_busy:
             available.append({
@@ -151,7 +171,7 @@ def get_position(customer_id: int, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    pos = get_queue_position(customer_id)
+    pos = asyncio.run(get_queue_position(customer_id))
     if not pos:
         return {"customer_id": customer_id, "in_queue": False}
 
@@ -228,50 +248,79 @@ def get_vendor_request_history(vendor_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/debug/state")
-def debug_state():
+async def debug_state():
     return {
-        "connected_vendors": list(connected_vendors.keys()),
-        "busy_vendors": list(busy_vendors),
-        "pending_requests": {k: v["customer_id"] for k, v in pending_requests.items()},
-        "call_queue": [{"customer": c["customer_id"], "vendor": c["vendor_id"]} for c in call_queue],
-        "active_calls": active_calls
+        "connected_vendors": [int(k) for k in await redis_client.hkeys(PREFIX_CONNECTED_VENDORS)],
+        "busy_vendors": [int(v) async for v in redis_client.sscan_iter(PREFIX_BUSY_VENDORS)],
+        "pending_requests": {
+            int(k): json.loads(v) async for k, v in redis_client.hgetall(PREFIX_PENDING_REQUESTS).items()
+        },
+        "call_queue": [
+            json.loads(item) async for item in redis_client.lrange(PREFIX_CALL_QUEUE, 0, -1)
+        ],
+        "active_calls": {
+            k: json.loads(v) async for k, v in redis_client.hgetall(PREFIX_ACTIVE_CALLS).items()
+        }
     }
 
 
 # -------------------------------
 # Call Management Functions
 # -------------------------------
+MAX_CALL_DURATION = 800  # 30 seconds for testing
+
+async def cleanup_vendor_connection(vendor_id: int, ws_id: str):
+    """Safely remove vendor from all state systems"""
+    print(f"🧹 Cleaning up stale connection for vendor {vendor_id}")
+
+    await redis_client.hdel(PREFIX_CONNECTED_VENDORS, str(vendor_id))
+    await redis_client.srem(PREFIX_BUSY_VENDORS, str(vendor_id))
+    await redis_client.hdel(PREFIX_PENDING_REQUESTS, str(vendor_id))
+    
+    if ws_id in connected_websockets:
+        del connected_websockets[ws_id]
+
+    print(f"✅ Vendor {vendor_id} fully cleaned up due to stale connection")
+
 async def assign_next_request_to_vendor(vendor_id: int):
     """
     Notify vendor of the next valid call request in queue (FIFO).
     Only includes currently connected customers.
     """
-    if vendor_id not in connected_vendors:
+    is_connected = await redis_client.hexists(PREFIX_CONNECTED_VENDORS, str(vendor_id))
+    if not is_connected:
         return
 
-    if vendor_id in busy_vendors or vendor_id in pending_requests:
+    is_busy = await redis_client.sismember(PREFIX_BUSY_VENDORS, str(vendor_id))
+    has_pending = await redis_client.hexists(PREFIX_PENDING_REQUESTS, str(vendor_id))
+    if is_busy or has_pending:
         return
 
-    # Get all requests for this vendor
-    vendor_queue = [req for req in call_queue if req["vendor_id"] == vendor_id]
+    queue = await redis_client.lrange(PREFIX_CALL_QUEUE, 0, -1)
+    entries = [json.loads(item) for item in queue if json.loads(item).get("vendor_id") == vendor_id]
 
-    # Sort by join time (oldest first)
-    vendor_queue.sort(key=lambda x: x["joined_at"])
+    # Sort by join time
+    entries.sort(key=lambda x: x["joined_at"])
 
-    # Keep only connected customers
-    connected_queue = [
-        req for req in vendor_queue
-        if req["customer_id"] in customer_websockets 
-        and is_websocket_connected(customer_websockets[req["customer_id"]])
-    ]
+    # Filter only connected customers
+    valid_entries = []
+    for req in entries:
+        cust_id = req["customer_id"]
+        is_cust_connected = await redis_client.hexists(PREFIX_CUSTOMER_WS, str(cust_id))
+        if is_cust_connected:
+            valid_entries.append(req)
 
-    # Update queue (remove stale)
-    call_queue[:] = [c for c in call_queue if c["vendor_id"] != vendor_id] + connected_queue
+    # Rebuild queue for this vendor
+    other_vendors = [item for item in queue if json.loads(item).get("vendor_id") != vendor_id]
+    new_queue = other_vendors + [json.dumps(req) for req in valid_entries]
+    await redis_client.delete(PREFIX_CALL_QUEUE)
+    if new_queue:
+        await redis_client.rpush(PREFIX_CALL_QUEUE, *new_queue)
 
-    if not connected_queue:
+    if not valid_entries:
         return
 
-    first_req = connected_queue[0]
+    first_req = valid_entries[0]
     customer_id = first_req["customer_id"]
 
     db = SessionLocal()
@@ -282,16 +331,18 @@ async def assign_next_request_to_vendor(vendor_id: int):
             return
 
         request_id = str(uuid.uuid4())
-        pending_request_ids[customer_id] = request_id
+        await redis_client.hset(PREFIX_PENDING_REQUEST_IDS, str(customer_id), request_id)
 
-        pending_requests[vendor_id] = {
+        pending_data = {
             "customer_id": customer_id,
             "product_id": first_req["product_id"],
             "room_name": first_req["room_name"],
-            "timestamp": datetime.now(timezone.utc),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "request_id": request_id
         }
+        await redis_client.hset(PREFIX_PENDING_REQUESTS, str(vendor_id), json.dumps(pending_data))
 
+        # Update request history
         db.query(CallRequestHistory).filter(
             CallRequestHistory.customer_id == customer_id,
             CallRequestHistory.vendor_id == vendor_id,
@@ -299,17 +350,27 @@ async def assign_next_request_to_vendor(vendor_id: int):
         ).update({"status": "assigned"})
         db.commit()
 
-        vendor_ws = connected_vendors.get(vendor_id)
-        if vendor_ws and is_websocket_connected(vendor_ws):
-            await vendor_ws.send_text(json.dumps({
-		"is_incoming_call": True,
-                "event": "call_request",
-                "customer_name": cust_user.user_name,
-                "customer_id": customer_id,
-                "product_id": first_req["product_id"],
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }))
-            print(f"📞 Sent call request to vendor {vendor_id} for customer {customer_id}")
+        # Send to vendor
+        ws_id = await redis_client.hget(PREFIX_CONNECTED_VENDORS, str(vendor_id))
+        ws = connected_websockets.get(ws_id)
+        if ws and is_websocket_connected(ws):
+            try:
+                await ws.send_text(json.dumps({
+                    "is_incoming_call": True,
+                    "event": "call_request",
+                    "customer_name": cust_user.user_name,
+                    "customer_id": customer_id,
+                    "product_id": first_req["product_id"],
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }))
+                print(f"📞 Sent call request to vendor {vendor_id} for customer {customer_id}")
+            except Exception as e:
+                print(f"❌ Failed to send message to vendor {vendor_id}: {e}")
+                # 👇 Clean up stale connection
+                await cleanup_vendor_connection(vendor_id, ws_id)
+        else:
+            print(f"⚠️ Cannot send to vendor {vendor_id}: WebSocket not connected")
+            await cleanup_vendor_connection(vendor_id, ws_id)
 
     except Exception as e:
         print(f"❌ Failed to assign request to vendor {vendor_id}: {e}")
@@ -319,11 +380,7 @@ async def assign_next_request_to_vendor(vendor_id: int):
 
 
 async def start_call_manual(customer_id: int, vendor_id: int, product_id: int, room_name: str, db: Session):
-    """
-    Start call only after vendor accepts.
-    """
     print(f"✅ Starting call after vendor accept: {customer_id} → {vendor_id}")
-
     accepted_at = datetime.now(timezone.utc)
 
     # Update request history
@@ -355,28 +412,33 @@ async def start_call_manual(customer_id: int, vendor_id: int, product_id: int, r
     finally:
         db_task.close()
 
-    customer_ws = customer_websockets.get(customer_id)
-    vendor_ws = connected_vendors.get(vendor_id)
+    # Get WebSockets
+    cust_ws_id = await redis_client.hget(PREFIX_CUSTOMER_WS, str(customer_id))
+    vend_ws_id = await redis_client.hget(PREFIX_CONNECTED_VENDORS, str(vendor_id))
 
-    if not (customer_ws and is_websocket_connected(customer_ws)):
+    cust_ws = connected_websockets.get(cust_ws_id)
+    vend_ws = connected_websockets.get(vend_ws_id)
+
+    if not (cust_ws and is_websocket_connected(cust_ws)):
         print(f"❌ Customer {customer_id} not connected")
         return
 
-    if not (vendor_ws and is_websocket_connected(vendor_ws)):
+    if not (vend_ws and is_websocket_connected(vend_ws)):
         print(f"❌ Vendor {vendor_id} not connected")
         return
 
-    busy_vendors.add(vendor_id)
-    active_calls[room_name] = {
+    await redis_client.sadd(PREFIX_BUSY_VENDORS, str(vendor_id))
+
+    call_info = {
         "customer_id": customer_id,
         "vendor_id": vendor_id,
         "product_id": product_id,
-        "start_time": accepted_at,
+        "start_time": accepted_at.isoformat(),
         "room_name": room_name
     }
+    await redis_client.hset(PREFIX_ACTIVE_CALLS, room_name, json.dumps(call_info))
 
     try:
-        # Create LiveKit room
         lk_room = await create_livekit_room(room_name)
         stream = StreamSession(
             user_id=vendor_id,
@@ -387,55 +449,53 @@ async def start_call_manual(customer_id: int, vendor_id: int, product_id: int, r
         db.add(stream)
         db.commit()
 
-        # Get user info
         cust_user = db.query(User).filter(User.user_id == customer_id).first()
         vend_user = db.query(User).filter(User.user_id == vendor_id).first()
 
         if not cust_user or not vend_user:
             print("❌ User not found")
-            busy_vendors.discard(vendor_id)
+            await redis_client.srem(PREFIX_BUSY_VENDORS, str(vendor_id))
             return
 
-        # Generate tokens
         customer_token = create_livekit_token(cust_user.user_name, str(customer_id), room_name, True)
         vendor_token = create_livekit_token(vend_user.user_name, str(vendor_id), room_name, True)
 
-        # Notify both
-        await customer_ws.send_text(json.dumps({
+        await cust_ws.send_text(json.dumps({
             "event": "call_started",
             "room": room_name,
             "token": customer_token
         }))
         print(f"✅ Sent call_started to customer {customer_id}")
 
-        await vendor_ws.send_text(json.dumps({
+        await vend_ws.send_text(json.dumps({
             "event": "call_started",
             "room": room_name,
             "token": vendor_token
         }))
         print(f"✅ Sent call_started to vendor {vendor_id}")
 
-        # Start duration monitor
         asyncio.create_task(monitor_call_duration(room_name, vendor_id, db))
 
     except Exception as e:
         print(f"❌ Failed to start call: {e}")
-        busy_vendors.discard(vendor_id)
+        await redis_client.srem(PREFIX_BUSY_VENDORS, str(vendor_id))
 
 
 async def monitor_call_duration(room_name: str, vendor_id: int, db: Session):
     await asyncio.sleep(MAX_CALL_DURATION)
-    if room_name in active_calls:
+    if await redis_client.hexists(PREFIX_ACTIVE_CALLS, room_name):
         await end_call(room_name, vendor_id, db)
 
 
 async def end_call(room_name: str, vendor_id: int, db: Session):
-    call = active_calls.pop(room_name, None)
-    if not call:
+    call_data = await redis_client.hget(PREFIX_ACTIVE_CALLS, room_name)
+    if not call_data:
         return
+    call = json.loads(call_data)
+    await redis_client.hdel(PREFIX_ACTIVE_CALLS, room_name)
 
     customer_id = call["customer_id"]
-    start_time = call["start_time"]
+    start_time = datetime.fromisoformat(call["start_time"]).replace(tzinfo=timezone.utc)
 
     now = datetime.now(timezone.utc)
     duration = int((now - start_time).total_seconds())
@@ -457,27 +517,27 @@ async def end_call(room_name: str, vendor_id: int, db: Session):
         db.rollback()
         print(f"❌ Failed to log call history: {e}")
 
-    cust_ws = customer_websockets.get(customer_id)
-    vend_ws = connected_vendors.get(vendor_id)
-
-    for ws in [cust_ws, vend_ws]:
+    # Notify users
+    for user_id in [customer_id, vendor_id]:
+        ws_id = await redis_client.hget(PREFIX_CUSTOMER_WS if user_id == customer_id else PREFIX_CONNECTED_VENDORS, str(user_id))
+        ws = connected_websockets.get(ws_id)
         if ws and is_websocket_connected(ws):
             try:
-                await ws.send_text(json.dumps({"event": "call_ended", "duration": duration}))
+                await ws.send_text(json.dumps({
+                    "event": "call_ended",
+                    "duration": duration,
+                    "customer_id": customer_id  # 👈 Add customer ID
+                }))
             except Exception as e:
-                print(f"❌ Failed to notify user: {e}")
+                print(f"❌ Failed to notify user {user_id}: {e}")
 
-    # ✅ Cleanup: Remove customer from queue and tracking
-    if customer_id in customer_websockets:
-        del customer_websockets[customer_id]
-
-    # ✅ Remove from call queue to prevent auto-re-request
-    call_queue[:] = [c for c in call_queue if c["customer_id"] != customer_id]
-
-    busy_vendors.discard(vendor_id)
+    # Cleanup
+    await redis_client.hdel(PREFIX_CUSTOMER_WS, str(customer_id))
+    await redis_client.lrem(PREFIX_CALL_QUEUE, 0, json.dumps({k: v for k, v in call.items() if k != "start_time"}))
+    await redis_client.srem(PREFIX_BUSY_VENDORS, str(vendor_id))
     await end_livekit_room(room_name)
 
-    # ✅ Check for next customer (only if someone else is waiting)
+    # Next request
     await asyncio.sleep(0.1)
     asyncio.create_task(assign_next_request_to_vendor(vendor_id))
 
@@ -499,6 +559,7 @@ async def websocket_endpoint(websocket: WebSocket):
     vendor_id = None
     product_id = None
     is_vendor = False
+    ws_id = None
 
     try:
         raw = await websocket.receive_text()
@@ -521,15 +582,18 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_text(json.dumps({"error": "Vendor not found"}))
             return
 
-        is_vendor = user.role_id == 0
-
-        # --- Vendor: Go Online ---
+        is_vendor = (user.role_id == 0)
+        ws_id = await generate_ws_id()
+        connected_websockets[ws_id] = websocket
+        expected_disconnect = False 
+        # Register in Redis
         if is_vendor:
-            if user.user_id in connected_vendors:
+            exists = await redis_client.hexists(PREFIX_CONNECTED_VENDORS, str(user_id))
+            if exists:
                 await websocket.send_text(json.dumps({"error": "Already connected"}))
                 return
 
-            connected_vendors[user.user_id] = websocket
+            await redis_client.hset(PREFIX_CONNECTED_VENDORS, str(user_id), ws_id)
             print(f"✅ Vendor {user_id} connected")
 
             await websocket.send_text(json.dumps({
@@ -537,9 +601,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 "message": "Waiting for call requests..."
             }))
 
-            # Check if any pending calls
-            asyncio.create_task(assign_next_request_to_vendor(user.user_id))
-
+            asyncio.create_task(assign_next_request_to_vendor(user_id))
+            expected_disconnect = False 
             while True:
                 try:
                     msg = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
@@ -551,19 +614,20 @@ async def websocket_endpoint(websocket: WebSocket):
                             await websocket.send_text(json.dumps({"error": "customer_id required"}))
                             continue
 
-                        req = pending_requests.get(vendor_id)
-                        if not req:
+                        req_data = await redis_client.hget(PREFIX_PENDING_REQUESTS, str(vendor_id))
+                        if not req_data:
                             print(f"❌ No pending request for vendor {vendor_id}")
                             continue
+                        req = json.loads(req_data)
                         if req["customer_id"] != customer_id:
                             print(f"❌ Mismatch: expected {req['customer_id']}, got {customer_id}")
                             continue
-                        if vendor_id in busy_vendors:
+
+                        if await redis_client.sismember(PREFIX_BUSY_VENDORS, str(vendor_id)):
                             print(f"❌ Vendor {vendor_id} is busy")
                             continue
 
                         print(f"✅ Vendor {vendor_id} accepted call from {customer_id}")
-
                         db_task = SessionLocal()
                         try:
                             await start_call_manual(
@@ -573,7 +637,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 room_name=req["room_name"],
                                 db=db_task
                             )
-                            del pending_requests[vendor_id]
+                            await redis_client.hdel(PREFIX_PENDING_REQUESTS, str(vendor_id))
                         except Exception as e:
                             print(f"❌ Error in start_call_manual: {e}")
                         finally:
@@ -581,14 +645,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
                     elif cmd.get("action") == "reject_call":
                         customer_id = cmd.get("customer_id")
-                        req = pending_requests.get(vendor_id)
-                        if not req or req["customer_id"] != customer_id:
+                        req_data = await redis_client.hget(PREFIX_PENDING_REQUESTS, str(vendor_id))
+                        if not req_data:
+                            continue
+                        req = json.loads(req_data)
+                        if req["customer_id"] != customer_id:
                             continue
 
                         db_task = SessionLocal()
                         try:
                             now = datetime.now(timezone.utc)
-                            wait_duration = int((now - req["timestamp"]).total_seconds())
+                            wait_duration = int((now - datetime.fromisoformat(req["timestamp"])).total_seconds())
                             db_task.query(CallRequestHistory).filter(
                                 CallRequestHistory.customer_id == customer_id,
                                 CallRequestHistory.vendor_id == vendor_id,
@@ -602,33 +669,78 @@ async def websocket_endpoint(websocket: WebSocket):
                         finally:
                             db_task.close()
 
-                        del pending_requests[vendor_id]
+                        await redis_client.hdel(PREFIX_PENDING_REQUESTS, str(vendor_id))
 
-                        cust_ws = customer_websockets.get(customer_id)
+                        cust_ws_id = await redis_client.hget(PREFIX_CUSTOMER_WS, str(customer_id))
+                        cust_ws = connected_websockets.get(cust_ws_id)
                         if cust_ws:
-                            await cust_ws.send_text(json.dumps({
-                                "event": "call_rejected",
-                                "message": "Vendor rejected your request."
-                            }))
+                            try:
+                                await cust_ws.send_text(json.dumps({
+                                    "event": "call_rejected",
+                                    "message": "Your call request was rejected by the vendor."
+                                }))
+                                await cust_ws.close()  # 👈 Explicitly close the customer's connection
+                                print(f"📞 Closed WebSocket for customer {customer_id} after rejection")
+                            except Exception as e:
+                                print(f"Error closing customer WebSocket: {e}")
+                            finally:
+                                # Remove from in-memory
+                                if cust_ws_id in connected_websockets:
+                                    del connected_websockets[cust_ws_id]
+                                # Remove from Redis
+                                await redis_client.hdel(PREFIX_CUSTOMER_WS, str(customer_id))
+                                # Remove from queue
+                                queue = await redis_client.lrange(PREFIX_CALL_QUEUE, 0, -1)
+                                new_queue = [item for item in queue if json.loads(item).get("customer_id") != customer_id]
+                                await redis_client.delete(PREFIX_CALL_QUEUE)
+                                if new_queue:
+                                    await redis_client.rpush(PREFIX_CALL_QUEUE, *new_queue)
+                                # Optional: remove from pending request IDs
+                                await redis_client.hdel(PREFIX_PENDING_REQUEST_IDS, str(customer_id))
 
-                        # Notify next in queue
                         asyncio.create_task(assign_next_request_to_vendor(vendor_id))
+
+                    elif cmd.get("action") == "end_call":
+                        room_name = cmd.get("room_name")
+                        if not room_name:
+                            await websocket.send_text(json.dumps({"error": "room_name required to end call"}))
+                            continue
+
+                        print(f"🛑 {('Vendor' if is_vendor else 'Customer')} {user_id} manually ended call in room {room_name}")
+
+                        # Reuse the existing end_call logic
+                        db_task = SessionLocal()
+                        try:
+                            await end_call(room_name, vendor_id, db_task)
+                        except Exception as e:
+                            print(f"❌ Error during manual end_call: {e}")
+                        finally:
+                            db_task.close()
+                        expected_disconnect = True 
+                        await websocket.send_text(json.dumps({
+                            "event": "call_ended",
+                            "message": "Call ended. You are still online and can receive new requests."
+                        }))
 
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
+                    expected_disconnect = False
                     print(f"⚠️ Vendor loop error: {e}")
                     break
 
-        # --- Customer: Request Call ---
         else:
             print(f"🟢 Customer {user_id} connected and requesting call to vendor {vendor_id}")
 
-            # Deduplicate: remove existing queue entry
-            call_queue[:] = [c for c in call_queue if c["customer_id"] != user_id]
+            # Remove duplicate
+            queue = await redis_client.lrange(PREFIX_CALL_QUEUE, 0, -1)
+            new_queue = [item for item in queue if json.loads(item).get("customer_id") != user_id]
+            await redis_client.delete(PREFIX_CALL_QUEUE)
+            if new_queue:
+                await redis_client.rpush(PREFIX_CALL_QUEUE, *new_queue)
 
             request_id = str(uuid.uuid4())
-            pending_request_ids[user_id] = request_id
+            await redis_client.hset(PREFIX_PENDING_REQUEST_IDS, str(user_id), request_id)
 
             room_name = f"room_{vendor_id}_{product_id}_{int(datetime.now(timezone.utc).timestamp())}"
 
@@ -656,32 +768,32 @@ async def websocket_endpoint(websocket: WebSocket):
                 "vendor_id": vendor_id,
                 "product_id": product_id,
                 "room_name": room_name,
-                "joined_at": datetime.now(timezone.utc),
+                "joined_at": datetime.now(timezone.utc).isoformat(),
                 "request_id": request_id,
                 "db_id": call_request_log.id
             }
-            call_queue.append(entry)
-            customer_websockets[user_id] = websocket
+            await redis_client.rpush(PREFIX_CALL_QUEUE, json.dumps(entry))
+            await redis_client.hset(PREFIX_CUSTOMER_WS, str(user_id), ws_id)
 
-            # ✅ Ensure vendor is notified of new request
             asyncio.create_task(assign_next_request_to_vendor(vendor_id))
 
-            # Get updated position
-            queue_pos_info = get_queue_position(user_id)
+            # Check vendor connection and busy status
+            is_vendor_connected = await redis_client.hexists(PREFIX_CONNECTED_VENDORS, str(vendor_id))
+            is_vendor_busy = await redis_client.sismember(PREFIX_BUSY_VENDORS, str(vendor_id))
 
-            # Determine message
+            queue_pos_info = await get_queue_position(user_id)
+
             if queue_pos_info:
                 position = queue_pos_info["position"]
                 wait_time = queue_pos_info["wait_time_seconds"]
-                is_vendor_busy = queue_pos_info["is_vendor_busy"]
             else:
                 position = None
                 wait_time = 0
-                is_vendor_busy = vendor_id in busy_vendors
 
-            if not queue_pos_info:
-                message = "Request received. Waiting for vendor availability."
-                estimated_wait = 0
+            # Determine message based on vendor's real-time status
+            if not is_vendor_connected:
+                message = "The vendor is currently offline. Your request will be delivered when they come online."
+                estimated_wait = None  # Unknown
             elif is_vendor_busy:
                 if position == 1:
                     message = "You're next in line. Estimated wait: 800 seconds."
@@ -689,19 +801,21 @@ async def websocket_endpoint(websocket: WebSocket):
                     message = f"{position - 1} people ahead. Estimated wait: {wait_time} seconds."
                 estimated_wait = wait_time
             else:
+                # Vendor is online and not busy
                 if position == 1:
                     message = "Vendor is available. Waiting for them to accept your request..."
-                    estimated_wait = 0
                 else:
                     message = f"{position - 1} people ahead. Estimated wait: {wait_time} seconds."
-                    estimated_wait = wait_time
+                estimated_wait = wait_time if position > 1 else 0
 
             await websocket.send_text(json.dumps({
                 "event": "request_sent",
                 "position": position,
                 "message": message,
                 "estimated_wait_seconds": estimated_wait,
-                "status": "waiting"
+                "status": "waiting",
+                "vendor_online": is_vendor_connected,
+                "vendor_busy": is_vendor_busy
             }))
             print(f"📩 Sent request_sent to customer {user_id}: {message}")
 
@@ -712,6 +826,25 @@ async def websocket_endpoint(websocket: WebSocket):
                     if data.get("action") == "cancel_request":
                         print(f"🛑 Customer {user_id} canceled request")
                         break
+                    elif data.get("action") == "end_call":
+                        room_name = data.get("room_name")
+                        if not room_name:
+                            await websocket.send_text(json.dumps({"error": "room_name required"}))
+                            continue
+
+                        print(f"🛑 Customer {user_id} manually ended call: {room_name}")
+
+                        db_task = SessionLocal()
+                        try:
+                            await end_call(room_name, vendor_id, db_task)
+                        except Exception as e:
+                            print(f"❌ Failed to end call: {e}")
+                            await websocket.send_text(json.dumps({"error": "Failed to end call"}))
+                        finally:
+                            db_task.close()
+
+                        break  # Exit loop after ending call
+
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
@@ -721,18 +854,28 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"WebSocket error: {e}")
     finally:
-        if is_vendor and user_id in connected_vendors:
-            print(f"🔴 Vendor {user_id} disconnected")
-            connected_vendors.pop(user_id, None)
-            busy_vendors.discard(user_id)
-            if user_id in pending_requests:
-                del pending_requests[user_id]
-            print(f"🧹 Vendor {user_id} cleaned up")
-
-        elif not is_vendor:
+        if is_vendor and user_id:
+            # Only clean up if it was a real disconnection
+            if not expected_disconnect:
+                print(f"🔴 Vendor {user_id} disconnected (network or error)")
+                await redis_client.hdel(PREFIX_CONNECTED_VENDORS, str(user_id))
+                await redis_client.srem(PREFIX_BUSY_VENDORS, str(user_id))
+                await redis_client.hdel(PREFIX_PENDING_REQUESTS, str(user_id))
+                if ws_id in connected_websockets:
+                    del connected_websockets[ws_id]
+                print(f"🧹 Vendor {user_id} cleaned up")
+            else:
+                print(f"ℹ️ Vendor {user_id} ended call but remains connected and available")
+        elif not is_vendor and user_id:
             print(f"🔴 Customer {user_id} disconnected")
-            customer_websockets.pop(user_id, None)
-            call_queue[:] = [c for c in call_queue if c["customer_id"] != user_id]
+            await redis_client.hdel(PREFIX_CUSTOMER_WS, str(user_id))
+            queue = await redis_client.lrange(PREFIX_CALL_QUEUE, 0, -1)
+            new_queue = [item for item in queue if json.loads(item).get("customer_id") != user_id]
+            await redis_client.delete(PREFIX_CALL_QUEUE)
+            if new_queue:
+                await redis_client.rpush(PREFIX_CALL_QUEUE, *new_queue)
+            if ws_id in connected_websockets:
+                del connected_websockets[ws_id]
             print(f"🧹 Customer {user_id} cleaned up")
 
         db.close()
