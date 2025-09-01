@@ -12,6 +12,12 @@ try:
         password="Gansram123",
         host="localhost"
     )
+    # conn = psycopg2.connect(
+    #     dbname="postgres",   # default DB
+    #     user="postgres",
+    #     password="root",
+    #     host="localhost"
+    # )
     conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM pg_database WHERE datname='live_streaming_app'")
@@ -29,6 +35,7 @@ except Exception as e:
 # Database connection URL
 password = quote_plus("root")
 DATABASE_URL = "postgresql://postgres:Gansram123@localhost/live_streaming_app"
+# DATABASE_URL = f"postgresql://postgres:{password}@localhost:5432/demo"
 
 engine = create_engine(DATABASE_URL,    pool_pre_ping=True, 
     pool_recycle=1800,)
