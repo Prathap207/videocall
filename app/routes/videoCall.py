@@ -302,6 +302,7 @@ async def assign_next_request_to_vendor(vendor_id: int):
         vendor_ws = connected_vendors.get(vendor_id)
         if vendor_ws and is_websocket_connected(vendor_ws):
             await vendor_ws.send_text(json.dumps({
+                "is_incoming_call":True,
                 "event": "call_request",
                 "customer_name": cust_user.user_name,
                 "customer_id": customer_id,
