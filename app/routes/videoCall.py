@@ -29,7 +29,7 @@ call_queue: list = []                            # [{ customer_id, vendor_id, ..
 pending_requests: Dict[int, Dict] = {}           # vendor_id → request data
 active_calls: Dict[str, Dict] = {}               # room_name → call info
 pending_request_ids: Dict[int, str] = {}         # customer_id → request_id
-MAX_CALL_DURATION = 30  # 30 seconds for testing
+MAX_CALL_DURATION = 800  # 800 seconds for testing
 
 # Dependency
 def get_db():
@@ -684,7 +684,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 estimated_wait = 0
             elif is_vendor_busy:
                 if position == 1:
-                    message = "You're next in line. Estimated wait: 30 seconds."
+                    message = "You're next in line. Estimated wait: 800 seconds."
                 else:
                     message = f"{position - 1} people ahead. Estimated wait: {wait_time} seconds."
                 estimated_wait = wait_time
