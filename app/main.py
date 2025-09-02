@@ -69,7 +69,7 @@ def root():
 # -------------------------------
 # Include Routes
 # -------------------------------
-mainRouter.mainRouter(app, prefix="/videoCall")  # Assumes this function adds routes to `app`
+app.include_router(videoCall.router, tags=["video-call"], prefix="/videoCall")
 
 # -------------------------------
 # Create Database Tables
