@@ -14,6 +14,7 @@ import redis.asyncio as redis
 from app.config import config
 from app.config.database import SessionLocal, engine, get_db
 from app.schemas.databaseSchemas import Base, User, StreamSession, CallHistory, CallRequestHistory
+from app.services.decrypt import decrypt_aes_cbc
 
 # Create tables
 Base.metadata.create_all(bind=engine)
@@ -563,7 +564,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         raw = await websocket.receive_text()
-        data = json.loads(raw)
+        # data = json.loads(raw)
+        try:
+            # Assume plain JSON first
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Maybe it's encrypted
+            SECRET_KEY = "test@123"  # Must match frontend
+            data = decrypt_aes_cbc(raw, SECRET_KEY)
+            if not data:
+                await websocket.send_text(json.dumps({"error": "Invalid or corrupted data"}))
+                return
         user_id = data.get("user_id")
         vendor_id = data.get("vendor_id")
         product_id = data.get("product_id")

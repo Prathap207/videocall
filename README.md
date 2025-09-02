@@ -4,10 +4,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict
 import uuid
 from starlette.websockets import WebSocketState
+
 # Local modules
 from app.config import config
 from app.config.database import SessionLocal, engine
@@ -28,8 +29,7 @@ call_queue: list = []                            # [{ customer_id, vendor_id, ..
 pending_requests: Dict[int, Dict] = {}           # vendor_id → request data
 active_calls: Dict[str, Dict] = {}               # room_name → call info
 pending_request_ids: Dict[int, str] = {}         # customer_id → request_id
-MAX_CALL_DURATION = 30  # 2 minutes
-
+MAX_CALL_DURATION = 30  # 30 seconds for testing
 
 # Dependency
 def get_db():
@@ -92,14 +92,15 @@ async def end_livekit_room(room_name: str):
 # -------------------------------
 def get_queue_position(customer_id: int) -> Optional[Dict]:
     target_entry = None
+    vendor_id = None
     for entry in call_queue:
         if entry["customer_id"] == customer_id:
             target_entry = entry
+            vendor_id = entry["vendor_id"]
             break
-    if not target_entry:
+    if not target_entry or not vendor_id:
         return None
 
-    vendor_id = target_entry["vendor_id"]
     ahead_count = 0
     for entry in call_queue:
         if entry["vendor_id"] == vendor_id:
@@ -113,8 +114,10 @@ def get_queue_position(customer_id: int) -> Optional[Dict]:
 
     return {
         "position": ahead_count + 1,
+        "ahead_count": ahead_count,
         "wait_time_seconds": wait_time,
-        "wait_time_human": f"{wait_time // 30} min {wait_time % 30} sec"
+        "wait_time_human": f"{wait_time // 60} min {wait_time % 60} sec",
+        "is_vendor_busy": is_vendor_busy
     }
 
 
@@ -239,134 +242,187 @@ def debug_state():
 # Call Management Functions
 # -------------------------------
 async def assign_next_request_to_vendor(vendor_id: int):
+    """
+    Notify vendor of the next valid call request in queue (FIFO).
+    Only includes currently connected customers.
+    """
     if vendor_id not in connected_vendors:
         return
 
-    vendor_ws = connected_vendors[vendor_id]
-
-    # Find next customer for this vendor
-    next_customer = None
-    for req in call_queue:
-        if req["vendor_id"] == vendor_id:
-            next_customer = req
-            break
-    if not next_customer:
+    if vendor_id in busy_vendors or vendor_id in pending_requests:
         return
 
-    customer_id = next_customer["customer_id"]
+    # Get all requests for this vendor
+    vendor_queue = [req for req in call_queue if req["vendor_id"] == vendor_id]
+
+    # Sort by join time (oldest first)
+    vendor_queue.sort(key=lambda x: x["joined_at"])
+
+    # Keep only connected customers
+    connected_queue = [
+        req for req in vendor_queue
+        if req["customer_id"] in customer_websockets 
+        and is_websocket_connected(customer_websockets[req["customer_id"]])
+    ]
+
+    # Update queue (remove stale)
+    call_queue[:] = [c for c in call_queue if c["vendor_id"] != vendor_id] + connected_queue
+
+    if not connected_queue:
+        return
+
+    first_req = connected_queue[0]
+    customer_id = first_req["customer_id"]
+
     db = SessionLocal()
     try:
         cust_user = db.query(User).filter(User.user_id == customer_id).first()
         if not cust_user:
+            print(f"❌ Customer {customer_id} not found in DB")
             return
 
-        # ✅ If vendor is FREE → send call_request
-        if vendor_id not in busy_vendors and vendor_id not in pending_requests:
-            db.query(CallRequestHistory).filter(
-                CallRequestHistory.customer_id == customer_id,
-                CallRequestHistory.vendor_id == vendor_id,
-                CallRequestHistory.status == "pending"
-            ).update({"status": "assigned"})
-            db.commit()
+        request_id = str(uuid.uuid4())
+        pending_request_ids[customer_id] = request_id
 
-            pending_requests[vendor_id] = {
+        pending_requests[vendor_id] = {
+            "customer_id": customer_id,
+            "product_id": first_req["product_id"],
+            "room_name": first_req["room_name"],
+            "timestamp": datetime.now(timezone.utc),
+            "request_id": request_id
+        }
+
+        db.query(CallRequestHistory).filter(
+            CallRequestHistory.customer_id == customer_id,
+            CallRequestHistory.vendor_id == vendor_id,
+            CallRequestHistory.status == "pending"
+        ).update({"status": "assigned"})
+        db.commit()
+
+        vendor_ws = connected_vendors.get(vendor_id)
+        if vendor_ws and is_websocket_connected(vendor_ws):
+            await vendor_ws.send_text(json.dumps({
+		"is_incoming_call": True,
+                "event": "call_request",
+                "customer_name": cust_user.user_name,
                 "customer_id": customer_id,
-                "vendor_id": vendor_id,
-                "product_id": next_customer["product_id"],
-                "room_name": next_customer["room_name"],
-                "request_id": next_customer["request_id"],
-                "timestamp": datetime.utcnow()
-            }
-
-            if is_websocket_connected(vendor_ws):
-                await vendor_ws.send_text(json.dumps({
-                    "event": "call_request",
-                    "customer_id": customer_id,
-                    "customer_name": cust_user.user_name,
-                    "position": get_queue_position(customer_id)["position"]
-                }))
-                print(f"📞 Sent call_request to vendor {vendor_id} for customer {customer_id}")
-
-        # ✅ If vendor is BUSY → check if backlog is growing
-        else:
-            queue_size = len([c for c in call_queue if c["vendor_id"] == vendor_id])
-            # Only notify if 2 or more are WAITING (excluding current)
-            if queue_size >= 2:
-                # Dedup logic (optional)
-                if is_websocket_connected(vendor_ws):
-                    try:
-                        await vendor_ws.send_text(json.dumps({
-                            "event": "queue_update",
-                            "message": f"{queue_size - 1} other(s) waiting after current call.",
-                            "queue_size": queue_size - 1
-                        }))
-                        print(f"📊 Notified vendor {vendor_id} of backlog: {queue_size - 1} waiting")
-                    except Exception as e:
-                        print(f"❌ Failed to send queue_update: {e}")
+                "product_id": first_req["product_id"],
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }))
+            print(f"📞 Sent call request to vendor {vendor_id} for customer {customer_id}")
 
     except Exception as e:
+        print(f"❌ Failed to assign request to vendor {vendor_id}: {e}")
         db.rollback()
-        print(f"❌ Failed to assign request: {e}")
     finally:
         db.close()
 
-        
-async def start_call(customer_id: int, vendor_id: int, product_id: int, room_name: str, db: Session):
-    print(f"📞 Starting call: {customer_id} → {vendor_id}")
 
-    req = pending_requests.get(vendor_id)
-    if not req or req["customer_id"] != customer_id:
-        print(f"⏭️ Call request for {customer_id} is outdated or not found")
+async def start_call_manual(customer_id: int, vendor_id: int, product_id: int, room_name: str, db: Session):
+    """
+    Start call only after vendor accepts.
+    """
+    print(f"✅ Starting call after vendor accept: {customer_id} → {vendor_id}")
+
+    accepted_at = datetime.now(timezone.utc)
+
+    # Update request history
+    db_task = SessionLocal()
+    try:
+        req_hist = db_task.query(CallRequestHistory).filter(
+            CallRequestHistory.customer_id == customer_id,
+            CallRequestHistory.vendor_id == vendor_id,
+            CallRequestHistory.status == "assigned"
+        ).first()
+
+        if not req_hist:
+            print(f"❌ Request history not found for {customer_id}")
+            return
+
+        requested_at = req_hist.requested_at.replace(tzinfo=timezone.utc) if req_hist.requested_at.tzinfo is None else req_hist.requested_at
+        wait_duration = int((accepted_at - requested_at).total_seconds())
+
+        db_task.query(CallRequestHistory).filter(CallRequestHistory.id == req_hist.id).update({
+            "accepted_at": accepted_at,
+            "status": "accepted",
+            "wait_duration_seconds": wait_duration
+        })
+        db_task.commit()
+    except Exception as e:
+        db_task.rollback()
+        print(f"❌ Failed to update request history: {e}")
         return
+    finally:
+        db_task.close()
 
-    current_request_id = pending_request_ids.get(customer_id)
-    if not current_request_id or current_request_id != req["request_id"]:
-        print(f"⏭️ Request ID mismatch for {customer_id}. Expected: {req['request_id']}, Got: {current_request_id}")
-        return
-
-    request_time = req["timestamp"]
-    accepted_at = datetime.utcnow()
-    wait_duration = int((accepted_at - request_time).total_seconds())
-
-    # ✅✅ CRITICAL: Remove from pending AND queue
-    del pending_requests[vendor_id]
-    # ✅ Remove from call queue
-    call_queue[:] = [c for c in call_queue if c["customer_id"] != customer_id]
-
-    # Get WebSockets
     customer_ws = customer_websockets.get(customer_id)
     vendor_ws = connected_vendors.get(vendor_id)
 
-    # ✅ Validate customer connection
-    if not is_websocket_connected(customer_ws):
-        print(f"❌ Customer {customer_id} WebSocket is not connected")
-        # Log as missed
-        db_task = SessionLocal()
-        try:
-            db_task.query(CallRequestHistory).filter(
-                CallRequestHistory.customer_id == customer_id,
-                CallRequestHistory.vendor_id == vendor_id,
-                CallRequestHistory.status == "assigned"
-            ).update({
-                "status": "missed",
-                "wait_duration_seconds": wait_duration
-            })
-            db_task.commit()
-            print(f"✅ Logged missed call for customer {customer_id}")
-        except Exception as e:
-            db_task.rollback()
-            print(f"❌ Failed to log missed call: {e}")
-        finally:
-            db_task.close()
-
-        # ✅ Also remove from customer_websockets if present
-        if customer_id in customer_websockets:
-            del customer_websockets[customer_id]
-
-        # Try next call
-        asyncio.create_task(start_next_call_if_any())
+    if not (customer_ws and is_websocket_connected(customer_ws)):
+        print(f"❌ Customer {customer_id} not connected")
         return
-    
+
+    if not (vendor_ws and is_websocket_connected(vendor_ws)):
+        print(f"❌ Vendor {vendor_id} not connected")
+        return
+
+    busy_vendors.add(vendor_id)
+    active_calls[room_name] = {
+        "customer_id": customer_id,
+        "vendor_id": vendor_id,
+        "product_id": product_id,
+        "start_time": accepted_at,
+        "room_name": room_name
+    }
+
+    try:
+        # Create LiveKit room
+        lk_room = await create_livekit_room(room_name)
+        stream = StreamSession(
+            user_id=vendor_id,
+            room_id=lk_room.sid,
+            room_name=room_name,
+            stream_is_live=True
+        )
+        db.add(stream)
+        db.commit()
+
+        # Get user info
+        cust_user = db.query(User).filter(User.user_id == customer_id).first()
+        vend_user = db.query(User).filter(User.user_id == vendor_id).first()
+
+        if not cust_user or not vend_user:
+            print("❌ User not found")
+            busy_vendors.discard(vendor_id)
+            return
+
+        # Generate tokens
+        customer_token = create_livekit_token(cust_user.user_name, str(customer_id), room_name, True)
+        vendor_token = create_livekit_token(vend_user.user_name, str(vendor_id), room_name, True)
+
+        # Notify both
+        await customer_ws.send_text(json.dumps({
+            "event": "call_started",
+            "room": room_name,
+            "token": customer_token
+        }))
+        print(f"✅ Sent call_started to customer {customer_id}")
+
+        await vendor_ws.send_text(json.dumps({
+            "event": "call_started",
+            "room": room_name,
+            "token": vendor_token
+        }))
+        print(f"✅ Sent call_started to vendor {vendor_id}")
+
+        # Start duration monitor
+        asyncio.create_task(monitor_call_duration(room_name, vendor_id, db))
+
+    except Exception as e:
+        print(f"❌ Failed to start call: {e}")
+        busy_vendors.discard(vendor_id)
+
+
 async def monitor_call_duration(room_name: str, vendor_id: int, db: Session):
     await asyncio.sleep(MAX_CALL_DURATION)
     if room_name in active_calls:
@@ -380,18 +436,17 @@ async def end_call(room_name: str, vendor_id: int, db: Session):
 
     customer_id = call["customer_id"]
     start_time = call["start_time"]
-    duration = int((datetime.utcnow() - start_time).total_seconds())
-    # After call ends
-    if customer_id in customer_websockets:
-        del customer_websockets[customer_id]
-    # Log call history
+
+    now = datetime.now(timezone.utc)
+    duration = int((now - start_time).total_seconds())
+
     history = CallHistory(
         vendor_id=vendor_id,
         customer_id=customer_id,
         product_id=call.get("product_id", 0),
         room_name=room_name,
         started_at=start_time,
-        ended_at=datetime.utcnow(),
+        ended_at=now,
         duration_seconds=duration
     )
     try:
@@ -402,7 +457,6 @@ async def end_call(room_name: str, vendor_id: int, db: Session):
         db.rollback()
         print(f"❌ Failed to log call history: {e}")
 
-    # Notify users
     cust_ws = customer_websockets.get(customer_id)
     vend_ws = connected_vendors.get(vendor_id)
 
@@ -411,28 +465,27 @@ async def end_call(room_name: str, vendor_id: int, db: Session):
             try:
                 await ws.send_text(json.dumps({"event": "call_ended", "duration": duration}))
             except Exception as e:
-                print(f"❌ Failed to notify user {ws} about call end: {e}")
+                print(f"❌ Failed to notify user: {e}")
 
-    # --- ✅ Critical: Cleanup state BEFORE async tasks ---
-    busy_vendors.discard(vendor_id)  # Mark vendor as free
-    await end_livekit_room(room_name)  # Best effort
+    # ✅ Cleanup: Remove customer from queue and tracking
+    if customer_id in customer_websockets:
+        del customer_websockets[customer_id]
 
-    # --- ✅ Trigger next call assignment ---
-    # This will check all idle vendors and assign next queued customer
-    asyncio.create_task(start_next_call_if_any())
+    # ✅ Remove from call queue to prevent auto-re-request
+    call_queue[:] = [c for c in call_queue if c["customer_id"] != customer_id]
 
-    print(f"🔚 Call ended and cleanup done for room {room_name}. Vendor {vendor_id} is now free.")
+    busy_vendors.discard(vendor_id)
+    await end_livekit_room(room_name)
+
+    # ✅ Check for next customer (only if someone else is waiting)
+    await asyncio.sleep(0.1)
+    asyncio.create_task(assign_next_request_to_vendor(vendor_id))
+
+    print(f"🔚 Call ended. Vendor {vendor_id} is free. Checking next request.")
+
 
 def is_websocket_connected(ws: WebSocket) -> bool:
     return ws is not None and ws.client_state == WebSocketState.CONNECTED
-
-async def start_next_call_if_any():
-    """
-    After a call ends or is rejected, assign the next customer to each idle vendor.
-    """
-    for vendor_id in connected_vendors:
-        if vendor_id not in busy_vendors:
-            await assign_next_request_to_vendor(vendor_id)
 
 
 # -------------------------------
@@ -446,7 +499,6 @@ async def websocket_endpoint(websocket: WebSocket):
     vendor_id = None
     product_id = None
     is_vendor = False
-    in_queue = False
 
     try:
         raw = await websocket.receive_text()
@@ -485,7 +537,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 "message": "Waiting for call requests..."
             }))
 
-            # Try to assign immediately
+            # Check if any pending calls
             asyncio.create_task(assign_next_request_to_vendor(user.user_id))
 
             while True:
@@ -494,42 +546,57 @@ async def websocket_endpoint(websocket: WebSocket):
                     cmd = json.loads(msg)
 
                     if cmd.get("action") == "accept_call":
-                        print("pending_requests:", pending_requests)
+                        customer_id = cmd.get("customer_id")
+                        if not customer_id:
+                            await websocket.send_text(json.dumps({"error": "customer_id required"}))
+                            continue
+
                         req = pending_requests.get(vendor_id)
-                        if not req or req["customer_id"] != cmd["customer_id"]:
+                        if not req:
+                            print(f"❌ No pending request for vendor {vendor_id}")
+                            continue
+                        if req["customer_id"] != customer_id:
+                            print(f"❌ Mismatch: expected {req['customer_id']}, got {customer_id}")
                             continue
                         if vendor_id in busy_vendors:
+                            print(f"❌ Vendor {vendor_id} is busy")
                             continue
+
+                        print(f"✅ Vendor {vendor_id} accepted call from {customer_id}")
 
                         db_task = SessionLocal()
                         try:
-                            await start_call(
-                                customer_id=req["customer_id"],
+                            await start_call_manual(
+                                customer_id=customer_id,
                                 vendor_id=vendor_id,
                                 product_id=req["product_id"],
                                 room_name=req["room_name"],
                                 db=db_task
                             )
+                            del pending_requests[vendor_id]
+                        except Exception as e:
+                            print(f"❌ Error in start_call_manual: {e}")
                         finally:
                             db_task.close()
 
                     elif cmd.get("action") == "reject_call":
+                        customer_id = cmd.get("customer_id")
                         req = pending_requests.get(vendor_id)
-                        if not req or req["customer_id"] != cmd["customer_id"]:
+                        if not req or req["customer_id"] != customer_id:
                             continue
 
-                        # Update DB
                         db_task = SessionLocal()
                         try:
-                            now = datetime.utcnow()
+                            now = datetime.now(timezone.utc)
+                            wait_duration = int((now - req["timestamp"]).total_seconds())
                             db_task.query(CallRequestHistory).filter(
-                                CallRequestHistory.customer_id == req["customer_id"],
+                                CallRequestHistory.customer_id == customer_id,
                                 CallRequestHistory.vendor_id == vendor_id,
                                 CallRequestHistory.status == "assigned"
                             ).update({
                                 "rejected_at": now,
                                 "status": "rejected",
-                                "wait_duration_seconds": int((now - req["timestamp"]).total_seconds())
+                                "wait_duration_seconds": wait_duration
                             })
                             db_task.commit()
                         finally:
@@ -537,34 +604,40 @@ async def websocket_endpoint(websocket: WebSocket):
 
                         del pending_requests[vendor_id]
 
-                        cust_ws = customer_websockets.get(req["customer_id"])
+                        cust_ws = customer_websockets.get(customer_id)
                         if cust_ws:
                             await cust_ws.send_text(json.dumps({
                                 "event": "call_rejected",
                                 "message": "Vendor rejected your request."
                             }))
 
-                        asyncio.create_task(start_next_call_if_any())
+                        # Notify next in queue
+                        asyncio.create_task(assign_next_request_to_vendor(vendor_id))
 
                 except asyncio.TimeoutError:
                     continue
+                except Exception as e:
+                    print(f"⚠️ Vendor loop error: {e}")
+                    break
 
         # --- Customer: Request Call ---
         else:
             print(f"🟢 Customer {user_id} connected and requesting call to vendor {vendor_id}")
 
+            # Deduplicate: remove existing queue entry
+            call_queue[:] = [c for c in call_queue if c["customer_id"] != user_id]
+
             request_id = str(uuid.uuid4())
             pending_request_ids[user_id] = request_id
 
-            room_name = f"room_{vendor_id}_{product_id}_{int(datetime.utcnow().timestamp())}"
+            room_name = f"room_{vendor_id}_{product_id}_{int(datetime.now(timezone.utc).timestamp())}"
 
-            # Log request immediately
             try:
                 call_request_log = CallRequestHistory(
                     vendor_id=vendor_id,
                     customer_id=user_id,
                     product_id=product_id,
-                    requested_at=datetime.utcnow(),
+                    requested_at=datetime.now(timezone.utc),
                     status="pending",
                     wait_duration_seconds=0
                 )
@@ -583,47 +656,55 @@ async def websocket_endpoint(websocket: WebSocket):
                 "vendor_id": vendor_id,
                 "product_id": product_id,
                 "room_name": room_name,
-                "joined_at": datetime.utcnow(),
+                "joined_at": datetime.now(timezone.utc),
                 "request_id": request_id,
                 "db_id": call_request_log.id
             }
             call_queue.append(entry)
             customer_websockets[user_id] = websocket
-            in_queue = True
+
+            # ✅ Ensure vendor is notified of new request
             asyncio.create_task(assign_next_request_to_vendor(vendor_id))
 
-            # --- After appending to call_queue and customer_websockets ---
-            # Estimate wait time and status message
-            vendor_is_busy = vendor_id in busy_vendors
+            # Get updated position
             queue_pos_info = get_queue_position(user_id)
 
-            # Base wait time from queue
-            estimated_wait = queue_pos_info["wait_time_seconds"] if queue_pos_info else 0
-
-            # If vendor is busy, add duration of current call (up to MAX_CALL_DURATION)
-            if vendor_is_busy and not any(c["customer_id"] == user_id for c in call_queue if c["vendor_id"] == vendor_id):
-                # This customer is not already in queue; add current call duration
-                estimated_wait += MAX_CALL_DURATION
-
-            # Format message
-            if vendor_is_busy and estimated_wait > 0:
-                if estimated_wait >= 30:
-                    wait_msg = f"Vendor is busy. Please wait approximately {estimated_wait} seconds for your turn."
-                else:
-                    wait_msg = f"Vendor is busy. Please wait {estimated_wait} seconds."
+            # Determine message
+            if queue_pos_info:
+                position = queue_pos_info["position"]
+                wait_time = queue_pos_info["wait_time_seconds"]
+                is_vendor_busy = queue_pos_info["is_vendor_busy"]
             else:
-                wait_msg = "Waiting for vendor to accept your call..."
+                position = None
+                wait_time = 0
+                is_vendor_busy = vendor_id in busy_vendors
+
+            if not queue_pos_info:
+                message = "Request received. Waiting for vendor availability."
+                estimated_wait = 0
+            elif is_vendor_busy:
+                if position == 1:
+                    message = "You're next in line. Estimated wait: 30 seconds."
+                else:
+                    message = f"{position - 1} people ahead. Estimated wait: {wait_time} seconds."
+                estimated_wait = wait_time
+            else:
+                if position == 1:
+                    message = "Vendor is available. Waiting for them to accept your request..."
+                    estimated_wait = 0
+                else:
+                    message = f"{position - 1} people ahead. Estimated wait: {wait_time} seconds."
+                    estimated_wait = wait_time
 
             await websocket.send_text(json.dumps({
                 "event": "request_sent",
-                "position": queue_pos_info["position"] if queue_pos_info else 1,
-                "message": wait_msg,
-                "estimated_wait_seconds": estimated_wait
+                "position": position,
+                "message": message,
+                "estimated_wait_seconds": estimated_wait,
+                "status": "waiting"
             }))
-            print(f"📩 Sent request_sent to customer {user_id}, position: {get_queue_position(user_id)['position']}")
+            print(f"📩 Sent request_sent to customer {user_id}: {message}")
 
-
-            # Wait for cancel
             while True:
                 try:
                     msg = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
@@ -634,8 +715,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
-                    print(f"⚠️  Error in customer loop: {e}")
-                    break  # WebSocket likely closed
+                    print(f"⚠️ Customer loop error: {e}")
+                    break
 
     except Exception as e:
         print(f"WebSocket error: {e}")
@@ -646,70 +727,12 @@ async def websocket_endpoint(websocket: WebSocket):
             busy_vendors.discard(user_id)
             if user_id in pending_requests:
                 del pending_requests[user_id]
-            asyncio.create_task(start_next_call_if_any())
+            print(f"🧹 Vendor {user_id} cleaned up")
 
-        elif not is_vendor and user_id in customer_websockets:
+        elif not is_vendor:
             print(f"🔴 Customer {user_id} disconnected")
-
-            # Cancel any pending request
-            if user_id in pending_request_ids:
-                req_id = pending_request_ids[user_id]
-                for vid, req in list(pending_requests.items()):
-                    if req["request_id"] == req_id:
-                        db_task = SessionLocal()
-                        try:
-                            now = datetime.utcnow()
-                            db_task.query(CallRequestHistory).filter(
-                                CallRequestHistory.customer_id == user_id,
-                                CallRequestHistory.vendor_id == vid,
-                                CallRequestHistory.status.in_(["pending", "assigned"])
-                            ).update({
-                                "canceled_at": now,
-                                "status": "canceled",
-                                "wait_duration_seconds": int((now - req["timestamp"]).total_seconds())
-                            })
-                            db_task.commit()
-                            print(f"✅ Canceled request for customer {user_id} (disconnected)")
-                        except Exception as e:
-                            print(f"❌ DB error on cancel: {e}")
-                        finally:
-                            db_task.close()
-                        del pending_requests[vid]
-                        break
-
-            # Remove from queue and map
-            call_queue[:] = [c for c in call_queue if c["customer_id"] != user_id]
             customer_websockets.pop(user_id, None)
-            print(f"🧹 Cleaned up customer {user_id}'s session")
-
-            asyncio.create_task(start_next_call_if_any())
+            call_queue[:] = [c for c in call_queue if c["customer_id"] != user_id]
+            print(f"🧹 Customer {user_id} cleaned up")
 
         db.close()
-
-async def notify_vendor_of_queue_update(vendor_id: int):
-    """
-    Notify vendor of queue size — ONLY if they are NOT in a call.
-    Prevents distraction during active calls.
-    """
-    if vendor_id in busy_vendors:
-        # Vendor is in a call → don't disturb
-        print(f"🔇 Not notifying vendor {vendor_id}: currently in a call.")
-        return
-
-    vendor_ws = connected_vendors.get(vendor_id)
-    if not vendor_ws or not is_websocket_connected(vendor_ws):
-        return
-
-    queue_size = len([c for c in call_queue if c["vendor_id"] == vendor_id])
-
-    # Only notify if there's someone waiting
-    if queue_size > 0:
-        try:
-            await vendor_ws.send_text(json.dumps({
-                "event": "queue_update",
-                "message": f"{queue_size} customer(s) waiting for you.",
-                "queue_size": queue_size
-            }))
-            print(f"📤 Sent queue update to vendor {vendor_id}: {queue_size} waiting")
-        except Exception as e:
-            print(f"❌ Failed to send queue update to vendor {vendor_id}: {e}")
